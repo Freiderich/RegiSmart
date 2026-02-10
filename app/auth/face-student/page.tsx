@@ -1,0 +1,310 @@
+'use client';
+
+import React, { useRef, useState, useEffect } from 'react';
+import { useRouter } from 'next/navigation';
+import { detectFaceInImage, recognizeFace, loadModels } from '@/lib/facial-recognition-pretrained';
+import { findFaceByStudentId } from '@/lib/mock-face-db';
+import { getStudentByNumber } from '@/lib/mock-students-db';
+import { Button } from '@/components/ui/button';
+import { Card } from '@/components/ui/card';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { ArrowLeft, Camera, CheckCircle, XCircle } from 'lucide-react';
+import Link from 'next/link';
+
+declare global {
+  interface Window {
+    faceapi: any;
+  }
+}
+
+export default function FaceStudentLoginPage() {
+  const router = useRouter();
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [studentNumber, setStudentNumber] = useState('');
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [faceDetected, setFaceDetected] = useState(false);
+  const [step, setStep] = useState<'input' | 'capture' | 'verify'>('input');
+  const [result, setResult] = useState<{ success: boolean; message: string } | null>(null);
+  const [modelsLoaded, setModelsLoaded] = useState(false);
+
+  // Load face-api.js and TensorFlow
+  useEffect(() => {
+    const script = document.createElement('script');
+    script.src = 'https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js';
+    script.async = true;
+    script.onload = async () => {
+      const tfScript = document.createElement('script');
+      tfScript.src = 'https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js';
+      tfScript.async = true;
+      tfScript.onload = async () => {
+        const backendScript = document.createElement('script');
+        backendScript.src = 'https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl@4.20.0/dist/tf-backend-webgl.min.js';
+        backendScript.async = true;
+        backendScript.onload = () => {
+          loadModels().then(() => setModelsLoaded(true));
+        };
+        document.body.appendChild(backendScript);
+      };
+      document.body.appendChild(tfScript);
+    };
+    document.body.appendChild(script);
+  }, []);
+
+  // Start camera when step is 'capture'
+  useEffect(() => {
+    if (step !== 'capture') return;
+
+    const startCamera = async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: 'user' },
+        });
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+          setIsStreaming(true);
+        }
+      } catch (error) {
+        console.error('Camera access denied:', error);
+        setResult({ success: false, message: 'Please allow camera access.' });
+      }
+    };
+
+    startCamera();
+
+    return () => {
+      if (videoRef.current && videoRef.current.srcObject) {
+        const tracks = (videoRef.current.srcObject as MediaStream).getTracks();
+        tracks.forEach(track => track.stop());
+      }
+    };
+  }, [step]);
+
+  const handleStartCapture = async () => {
+    if (!studentNumber.trim()) {
+      setResult({ success: false, message: 'Please enter a student number.' });
+      return;
+    }
+
+    // Verify student exists in database
+    const student = getStudentByNumber(studentNumber);
+    if (!student) {
+      setResult({ success: false, message: 'Student number not found in database.' });
+      return;
+    }
+
+    // Verify student has enrolled face
+    const faceRecord = findFaceByStudentId(studentNumber);
+    if (!faceRecord) {
+      setResult({ success: false, message: 'No face enrollment found for this student. Please enroll first.' });
+      return;
+    }
+
+    setStep('capture');
+    setResult(null);
+  };
+
+  const captureAndVerify = async () => {
+    if (!videoRef.current || !canvasRef.current) return;
+
+    setIsProcessing(true);
+    try {
+      const context = canvasRef.current.getContext('2d');
+      if (!context) return;
+
+      canvasRef.current.width = videoRef.current.videoWidth;
+      canvasRef.current.height = videoRef.current.videoHeight;
+      context.drawImage(videoRef.current, 0, 0);
+
+      if (window.faceapi) {
+        // Recognize face and verify against database
+        const recognition = await recognizeFace(canvasRef.current);
+        
+        // For login, verify that:
+        // 1. A face is detected and verified in the database
+        // 2. The recognized student matches the entered student number
+        if (recognition.verified && recognition.studentId === studentNumber) {
+          setStep('verify');
+          setFaceDetected(true);
+          const student = getStudentByNumber(studentNumber);
+          
+          if (student) {
+            // Store user info in sessionStorage (including email)
+            sessionStorage.setItem('currentUser', JSON.stringify({
+              studentNumber: student.studentNumber,
+              fullName: student.fullName,
+              email: student.email,
+            }));
+
+            setResult({ 
+              success: true, 
+              message: `Face verified! Welcome, ${student.fullName}. Redirecting...` 
+            });
+
+            // Redirect to dashboard after 2 seconds
+            setTimeout(() => {
+              router.push('/dashboard');
+            }, 2000);
+          }
+        } else if (!recognition.verified) {
+          setFaceDetected(false);
+          setResult({ 
+            success: false, 
+            message: `Face not recognized or not found in database. ${recognition.message}` 
+          });
+        } else if (recognition.studentId !== studentNumber) {
+          setFaceDetected(false);
+          setResult({ 
+            success: false, 
+            message: `Face belongs to a different student (${recognition.studentId}). Please try again.` 
+          });
+        }
+      }
+    } catch (error) {
+      console.error('Verification error:', error);
+      setResult({ success: false, message: 'Error during face verification. Please try again.' });
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const handleBackToInput = () => {
+    setStep('input');
+    setStudentNumber('');
+    setResult(null);
+    setFaceDetected(false);
+  };
+
+  return (
+    <div className="min-h-screen bg-background">
+      {/* Header */}
+      <header className="border-b border-border bg-card">
+        <div className="container mx-auto px-4 py-4">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 bg-primary rounded-full flex items-center justify-center">
+              <span className="text-primary-foreground font-bold">HAU</span>
+            </div>
+            <div>
+              <h1 className="font-bold text-foreground">Holy Angel University</h1>
+              <p className="text-xs text-muted-foreground">Face & Student Number Login</p>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <main className="container mx-auto px-4 py-8">
+        <div className="max-w-md mx-auto">
+          <div className="mb-6">
+            <Button variant="ghost" size="sm" asChild>
+              <Link href="/auth">
+                <ArrowLeft className="w-4 h-4 mr-2" />
+                Back to Auth
+              </Link>
+            </Button>
+          </div>
+
+          {step === 'input' && (
+            <Card className="p-8">
+              <div className="text-center mb-8">
+                <div className="w-16 h-16 bg-primary rounded-full flex items-center justify-center mx-auto mb-4">
+                  <Camera className="w-8 h-8 text-primary-foreground" />
+                </div>
+                <h2 className="text-2xl font-bold text-foreground mb-2">Face & Student ID Login</h2>
+                <p className="text-sm text-muted-foreground">Enter your student number to verify your face</p>
+              </div>
+
+              <div className="space-y-6">
+                <div>
+                  <Label htmlFor="student-number">Student Number</Label>
+                  <Input
+                    id="student-number"
+                    placeholder="e.g., 20876916"
+                    value={studentNumber}
+                    onChange={(e) => setStudentNumber(e.target.value)}
+                    onKeyPress={(e) => e.key === 'Enter' && handleStartCapture()}
+                  />
+                </div>
+
+                {result && (
+                  <div className={`p-4 rounded-lg border ${result.success ? 'bg-green-50 border-green-200' : 'bg-red-50 border-red-200'}`}>
+                    <p className={`text-sm ${result.success ? 'text-green-700' : 'text-red-700'}`}>
+                      {result.message}
+                    </p>
+                  </div>
+                )}
+
+                <Button onClick={handleStartCapture} className="w-full" size="lg">
+                  Continue to Face Capture
+                </Button>
+              </div>
+            </Card>
+          )}
+
+          {step === 'capture' && (
+            <Card className="p-8">
+              <div className="text-center mb-6">
+                <h2 className="text-2xl font-bold text-foreground mb-2">Capture Your Face</h2>
+                <p className="text-sm text-muted-foreground">Position your face in the center and click capture</p>
+              </div>
+
+              <div className="space-y-6">
+                {/* Model Status */}
+                <div className={`p-3 rounded-lg text-sm ${modelsLoaded ? 'bg-green-50 border border-green-200 text-green-700' : 'bg-yellow-50 border border-yellow-200 text-yellow-700'}`}>
+                  {modelsLoaded ? '✓ Models loaded' : '⏳ Loading models...'}
+                </div>
+
+                {/* Camera Feed */}
+                <div className="text-center">
+                  <video
+                    ref={videoRef}
+                    autoPlay
+                    playsInline
+                    className={`w-full rounded-lg border-2 ${faceDetected ? 'border-green-500' : 'border-gray-300'}`}
+                  />
+                </div>
+
+                <canvas ref={canvasRef} style={{ display: 'none' }} />
+
+                {/* Action Buttons */}
+                <div className="flex gap-3">
+                  <Button
+                    onClick={handleBackToInput}
+                    variant="outline"
+                    className="flex-1"
+                    disabled={isProcessing}
+                  >
+                    Back
+                  </Button>
+                  <Button
+                    onClick={captureAndVerify}
+                    disabled={isProcessing || !modelsLoaded}
+                    className="flex-1"
+                  >
+                    {isProcessing ? 'Verifying...' : 'Capture & Verify'}
+                  </Button>
+                </div>
+
+                {result && (
+                  <div className={`p-4 rounded-lg border ${result.success ? 'bg-green-50 border-green-200' : 'bg-red-50 border-red-200'}`}>
+                    <div className="flex gap-2">
+                      {result.success ? (
+                        <CheckCircle className="w-5 h-5 text-green-600 shrink-0 mt-0.5" />
+                      ) : (
+                        <XCircle className="w-5 h-5 text-red-600 shrink-0 mt-0.5" />
+                      )}
+                      <p className={`text-sm ${result.success ? 'text-green-700' : 'text-red-700'}`}>
+                        {result.message}
+                      </p>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </Card>
+          )}
+        </div>
+      </main>
+    </div>
+  );
+}
