@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect, useRef } from "react"
+import { useEffect, useRef, useState } from "react"
 import Link from "next/link"
 import { useRouter } from "next/navigation"
 import { ArrowLeft, Mic, MicOff, Volume2, VolumeX, RotateCcw } from "lucide-react"
@@ -13,6 +13,7 @@ type ConversationStep =
   | "email-input"
   | "password-input"
   | "student-number"
+  | "student-number-confirm"
   | "face-verify"
   | "authenticated"
 
@@ -21,45 +22,117 @@ export default function VoiceModePage() {
   const [isListening, setIsListening] = useState(false)
   const [isSpeaking, setIsSpeaking] = useState(false)
   const [transcript, setTranscript] = useState("")
+  const [statusMessage, setStatusMessage] = useState("")
+  const [diagnostics, setDiagnostics] = useState({
+    speechSupported: false,
+    secureContext: false,
+    micPermission: "unknown" as "unknown" | "granted" | "denied" | "prompt",
+  })
   const [conversation, setConversation] = useState<Array<{ speaker: "bot" | "user"; text: string }>>([])
   const [step, setStep] = useState<ConversationStep>("welcome")
   const [pendingStudentNumber, setPendingStudentNumber] = useState<string>("")
   const [isMuted, setIsMuted] = useState(false)
   const recognitionRef = useRef<any>(null)
   const synthRef = useRef<SpeechSynthesis | null>(null)
-  const hasSpokenRef = useRef(false);
-
+  const autoListenRef = useRef(true)
+  const receivedResultRef = useRef(false)
+  const sessionActiveRef = useRef(false)
+  const retryCountRef = useRef(0)
+  const retryTimeoutRef = useRef<number | null>(null)
+  const listenStartRef = useRef<number | null>(null)
+  const maxListenMs = 8000
 
   useEffect(() => {
     if (typeof window !== "undefined") {
       synthRef.current = window.speechSynthesis
 
-      // Initialize Speech Recognition
-      const SpeechRecognition = window.SpeechRecognition || (window as any).webkitSpeechRecognition
+      const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition
+      setDiagnostics((prev) => ({
+        ...prev,
+        speechSupported: Boolean(SpeechRecognition),
+        secureContext: window.isSecureContext || location.hostname === "localhost",
+      }))
+
+      if (navigator.permissions?.query) {
+        navigator.permissions
+          .query({ name: "microphone" as PermissionName })
+          .then((result) => {
+            setDiagnostics((prev) => ({
+              ...prev,
+              micPermission: result.state,
+            }))
+          })
+          .catch(() => undefined)
+      }
       if (SpeechRecognition) {
         recognitionRef.current = new SpeechRecognition()
-        recognitionRef.current.continuous = false; // Only listen for one phrase at a time
-        recognitionRef.current.interimResults = false; // Only process final results
+        recognitionRef.current.continuous = false
+        recognitionRef.current.interimResults = true
+        recognitionRef.current.lang = "en-US"
+        recognitionRef.current.maxAlternatives = 1
 
         recognitionRef.current.onresult = (event: any) => {
+          receivedResultRef.current = true
           for (let i = event.resultIndex; i < event.results.length; ++i) {
+            const transcriptText = event.results[i][0].transcript
             if (event.results[i].isFinal) {
-              const transcriptText = event.results[i][0].transcript;
-              setTranscript("");
-              handleUserSpeech(transcriptText);
+              setTranscript("")
+              setStatusMessage("")
+              sessionActiveRef.current = false
+              try {
+                recognitionRef.current?.stop()
+              } catch (error) {
+                // ignore
+              }
+              handleUserSpeech(transcriptText)
+            } else {
+              setTranscript(transcriptText)
             }
           }
-        };
+        }
 
         recognitionRef.current.onerror = (event: any) => {
-          console.error("Speech recognition error:", event.error)
           setIsListening(false)
+          const message = event?.error ? `Speech error: ${event.error}. Tap to try again.` : "Speech error. Tap to try again."
+          setStatusMessage(message)
+        }
+
+        recognitionRef.current.onstart = () => {
+          setStatusMessage("Listening...")
+        }
+
+        recognitionRef.current.onend = () => {
+          setIsListening(false)
+          if (retryTimeoutRef.current) {
+            window.clearTimeout(retryTimeoutRef.current)
+            retryTimeoutRef.current = null
+          }
+          if (sessionActiveRef.current && !receivedResultRef.current) {
+            retryCountRef.current += 1
+            const listenStart = listenStartRef.current || Date.now()
+            const elapsed = Date.now() - listenStart
+            if (elapsed < maxListenMs) {
+              retryTimeoutRef.current = window.setTimeout(() => {
+                if (sessionActiveRef.current && !isSpeaking) {
+                  try {
+                    recognitionRef.current?.start()
+                    setIsListening(true)
+                  } catch (error) {
+                    setStatusMessage("Tap to try again.")
+                  }
+                }
+              }, 350)
+            } else {
+              setStatusMessage("I didn't hear anything. Tap to try again.")
+              sessionActiveRef.current = false
+            }
+          }
+          receivedResultRef.current = false
         }
       }
 
-      // Start with welcome message
       speak(
-        "Hello! Welcome to Holy Angel University Registrar Services. I'm here to help you request your documents. Would you like to login with your school email, student number with face recognition, or both?",
+        "Hello! Welcome to Holy Angel University Registrar Services. I'm here to help with login and document requests. Would you like to use your school email, student number with face recognition, or both?",
       )
     }
 
@@ -73,41 +146,70 @@ export default function VoiceModePage() {
     }
   }, [])
 
-  // Helper to stop listening
   const stopListening = () => {
     if (recognitionRef.current && isListening) {
-      recognitionRef.current.stop();
-      setIsListening(false);
+      recognitionRef.current.stop()
+      setIsListening(false)
     }
-  };
+  }
 
-  // Helper to start listening
-  const startListening = () => {
-    if (recognitionRef.current && !isListening) {
-      recognitionRef.current.start();
-      setIsListening(true);
+  const startListening = async () => {
+    if (!recognitionRef.current || isListening) return
+
+    if (!window.isSecureContext && location.hostname !== "localhost") {
+      setStatusMessage("Speech recognition requires HTTPS or localhost.")
+      return
     }
-  };
+
+    try {
+      if (navigator.mediaDevices?.getUserMedia) {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+        stream.getTracks().forEach((track) => track.stop())
+        setDiagnostics((prev) => ({
+          ...prev,
+          micPermission: "granted",
+        }))
+      }
+    } catch (error) {
+      setStatusMessage("Microphone access is blocked. Please allow mic access and try again.")
+      setDiagnostics((prev) => ({
+        ...prev,
+        micPermission: "denied",
+      }))
+      return
+    }
+
+    setStatusMessage("")
+    receivedResultRef.current = false
+    retryCountRef.current = 0
+    sessionActiveRef.current = true
+    listenStartRef.current = Date.now()
+    recognitionRef.current.start()
+    setIsListening(true)
+  }
 
   const speak = (text: string) => {
-    if (!synthRef.current || isMuted) return;
+    if (!synthRef.current || isMuted) return
 
-    stopListening(); // Stop listening while bot is speaking
+    stopListening()
+    setStatusMessage("")
 
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.rate = 0.9;
-    utterance.pitch = 1;
-    utterance.volume = 1;
+    const utterance = new SpeechSynthesisUtterance(text)
+    utterance.rate = 0.9
+    utterance.pitch = 1
+    utterance.volume = 1
 
-    utterance.onstart = () => setIsSpeaking(true);
+    utterance.onstart = () => setIsSpeaking(true)
     utterance.onend = () => {
-      setIsSpeaking(false);
-      startListening(); // Resume listening after bot finishes
-    };
+      setIsSpeaking(false)
+      if (autoListenRef.current) {
+        startListening().catch(() => undefined)
+      }
+    }
 
-    synthRef.current.speak(utterance);
-    setConversation((prev) => [...prev, { speaker: "bot", text }]);
-  };
+    synthRef.current.speak(utterance)
+    setConversation((prev) => [...prev, { speaker: "bot", text }])
+  }
 
   const handleUserSpeech = (text: string) => {
     setConversation((prev) => [...prev, { speaker: "user", text }])
@@ -117,35 +219,23 @@ export default function VoiceModePage() {
 
     switch (step) {
       case "welcome":
-  case "auth-choice": {
-    // Check for greetings first
-    if (
-      lowerText.includes("hello") ||
-      lowerText.includes("hi") ||
-      lowerText.includes("hey")
-    ) {
-      speak(
-        "Hello! What would you like to do? You can say email, face recognition, or both."
-      );
-    } else if (lowerText.includes("email") && !lowerText.includes("face")) {
-      setStep("email-input");
-      speak("Great! Please say your school email address clearly.");
-    } else if (lowerText.includes("face") || lowerText.includes("recognition")) {
-      setStep("student-number");
-      speak("Perfect! Please say your student number clearly.");
-    } else if (lowerText.includes("both") || lowerText.includes("combined")) {
-      setStep("email-input");
-      speak(
-        "Excellent choice for maximum security. Let's start with your email address."
-      );
-    } else {
-      speak(
-        "I didn't catch that. Please say email, face recognition, or both."
-      );
-    }
-    break;
-  }
-
+      case "auth-choice": {
+        if (lowerText.includes("hello") || lowerText.includes("hi") || lowerText.includes("hey")) {
+          speak("Hello! You can say email, face recognition, or both.")
+        } else if (lowerText.includes("email") && !lowerText.includes("face")) {
+          setStep("email-input")
+          speak("Great! Please say your school email address clearly.")
+        } else if (lowerText.includes("face") || lowerText.includes("recognition")) {
+          setStep("student-number")
+          speak("Perfect! Please say your student number clearly.")
+        } else if (lowerText.includes("both") || lowerText.includes("combined")) {
+          setStep("email-input")
+          speak("Excellent choice. Let's start with your email address.")
+        } else {
+          speak("I didn't catch that. Please say email, face recognition, or both.")
+        }
+        break
+      }
 
       case "email-input":
         speak(`I heard ${text}. Is that correct? Say yes to continue or no to try again.`)
@@ -155,6 +245,9 @@ export default function VoiceModePage() {
       case "password-input":
         if (lowerText.includes("yes")) {
           speak("Thank you. Now please say your password.")
+        } else if (lowerText.includes("no")) {
+          setStep("email-input")
+          speak("Okay, let's try again. Please say your school email address clearly.")
         } else {
           setStep("authenticated")
           speak("Authentication successful! Welcome. Redirecting to your dashboard.")
@@ -167,45 +260,47 @@ export default function VoiceModePage() {
 
       case "student-number":
         if (text.trim()) {
-          setPendingStudentNumber(text.trim());
-          speak(`I heard ${text}. Is that correct? Say yes to continue or no to try again.`);
-          setStep("student-number-confirm");
+          setPendingStudentNumber(text.trim())
+          speak(`I heard ${text}. Is that correct? Say yes to continue or no to try again.`)
+          setStep("student-number-confirm")
         } else {
-          speak("I didn't catch that. Please say your student number clearly.");
+          speak("I didn't catch that. Please say your student number clearly.")
         }
         break
 
       case "student-number-confirm":
         if (lowerText.includes("yes")) {
-          setStep("face-verify");
-          speak("Perfect! Now I need to verify your face. Please look at the camera and make sure your face is well-lit. Blink when you're ready.");
+          setStep("face-verify")
+          speak(
+            "Perfect! Now I need to verify your face. Please look at the camera and make sure your face is well-lit. Blink when you're ready.",
+          )
         } else if (lowerText.includes("no")) {
-          setPendingStudentNumber("");
-          setStep("student-number");
-          speak("Let's try again. Please say your student number clearly.");
+          setPendingStudentNumber("")
+          setStep("student-number")
+          speak("Let's try again. Please say your student number clearly.")
         } else {
-          speak(`Please say 'yes' to confirm your student number (${pendingStudentNumber}) or 'no' to retry.`);
+          speak(`Please say 'yes' to confirm your student number (${pendingStudentNumber}) or 'no' to retry.`)
         }
         break
 
       case "face-verify":
         if (lowerText.includes("yes")) {
           speak(
-            "Perfect! Now I need to verify your face. Please look at the camera and make sure your face is well-lit. Blink when you're ready."
-          );
+            "Perfect! Now I need to verify your face. Please look at the camera and make sure your face is well-lit. Blink when you're ready.",
+          )
           setTimeout(() => {
-            setStep("authenticated");
-            speak("Face verified! Welcome. Redirecting to your dashboard.");
+            setStep("authenticated")
+            speak("Face verified! Welcome. Redirecting to your dashboard.")
             setTimeout(() => {
-              sessionStorage.setItem("authenticated", "true");
-              router.push("/dashboard");
-            }, 3000);
-          }, 3000);
+              sessionStorage.setItem("authenticated", "true")
+              router.push("/dashboard")
+            }, 3000)
+          }, 3000)
         } else if (lowerText.includes("no")) {
-          speak("Let's try again. Please say your student number clearly.");
-          setStep("student-number");
+          speak("Let's try again. Please say your student number clearly.")
+          setStep("student-number")
         } else {
-          speak("Please say 'yes' to confirm or 'no' to retry.");
+          speak("Please say 'yes' to confirm or 'no' to retry.")
         }
         break
     }
@@ -213,17 +308,22 @@ export default function VoiceModePage() {
 
   const toggleListening = () => {
     if (!recognitionRef.current) {
-      alert("Speech recognition is not supported in your browser. Please use Chrome or Edge.");
-      return;
+      alert("Speech recognition is not supported in your browser. Please use Safari, Chrome, or Edge.")
+      return
     }
 
     if (isListening) {
-      recognitionRef.current.stop();
-      setIsListening(false);
+      sessionActiveRef.current = false
+      listenStartRef.current = null
+      recognitionRef.current.stop()
+      setIsListening(false)
     } else {
-      setTranscript("");
-      recognitionRef.current.start();
-      setIsListening(true);
+      setTranscript("")
+      setStatusMessage("")
+      retryCountRef.current = 0
+      sessionActiveRef.current = true
+      listenStartRef.current = Date.now()
+      startListening().catch(() => undefined)
     }
   }
 
@@ -238,6 +338,10 @@ export default function VoiceModePage() {
     setConversation([])
     setStep("welcome")
     setTranscript("")
+    setStatusMessage("")
+    sessionActiveRef.current = false
+    retryCountRef.current = 0
+    listenStartRef.current = null
     if (synthRef.current) {
       synthRef.current.cancel()
     }
@@ -271,10 +375,11 @@ export default function VoiceModePage() {
       </header>
 
       <main className="container mx-auto px-4 py-8 max-w-4xl">
-        {/* Bot Avatar */}
         <div className="flex justify-center mb-8">
           <div
-            className={`relative w-32 h-32 bg-primary rounded-full flex items-center justify-center ${isSpeaking ? "animate-pulse" : ""}`}
+            className={`relative w-32 h-32 bg-primary rounded-full flex items-center justify-center ${
+              isSpeaking ? "animate-pulse" : ""
+            }`}
           >
             <span className="text-primary-foreground font-bold text-4xl">HAU</span>
             {isSpeaking && (
@@ -283,7 +388,6 @@ export default function VoiceModePage() {
           </div>
         </div>
 
-        {/* Conversation Display */}
         <Card className="p-6 mb-6 max-h-96 overflow-y-auto">
           <div className="space-y-4">
             {conversation.length === 0 ? (
@@ -305,15 +409,16 @@ export default function VoiceModePage() {
           </div>
         </Card>
 
-        {/* Live Transcript */}
-        {transcript && (
+        {(transcript || statusMessage) && (
           <Card className="p-4 mb-6 bg-accent">
-            <p className="text-sm text-muted-foreground mb-1">Listening...</p>
-            <p className="text-foreground">{transcript}</p>
+            <p className="text-sm text-muted-foreground mb-1">
+              {isListening ? "Listening..." : "Ready"}
+            </p>
+            {transcript ? <p className="text-foreground">{transcript}</p> : null}
+            {statusMessage ? <p className="text-foreground">{statusMessage}</p> : null}
           </Card>
         )}
 
-        {/* Microphone Control */}
         <div className="flex flex-col items-center gap-4">
           <button
             onClick={toggleListening}
@@ -330,7 +435,6 @@ export default function VoiceModePage() {
           <p className="text-sm text-muted-foreground">{isListening ? "Tap to stop listening" : "Tap to talk"}</p>
         </div>
 
-        {/* Instructions */}
         <Card className="mt-8 p-6 bg-muted/50">
           <h3 className="font-semibold text-foreground mb-3">Voice Commands</h3>
           <ul className="text-sm text-muted-foreground space-y-2">
@@ -340,6 +444,11 @@ export default function VoiceModePage() {
             <li>• Say "yes" or "no" to confirm or retry</li>
             <li>• Use the mute button to disable voice responses</li>
           </ul>
+          <div className="mt-4 text-xs text-muted-foreground">
+            <p>Speech support: {diagnostics.speechSupported ? "available" : "not available"}</p>
+            <p>Secure context: {diagnostics.secureContext ? "yes" : "no"}</p>
+            <p>Mic permission: {diagnostics.micPermission}</p>
+          </div>
         </Card>
       </main>
     </div>
